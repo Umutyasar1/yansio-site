@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<title>Yansio</title>
+<!-- Yansio Cast alıcısı: telefondaki Android ekran yansıtmasının ham H.264 akışını tam ekran oynatır.
+     Gönderici (uygulama) urn:x-cast:app.yansio.mirror ad alanına {type:"PLAY", url} yollar.
+     Kurulum ve kayıt: docs/CAST_ALICI.md (Yansio deposu). -->
+<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jmuxer@2.0.5/dist/jmuxer.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #06080D; overflow: hidden; font-family: "Google Sans", Roboto, sans-serif; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #status { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px; color: #F3F5F9; transition: opacity .4s; }
+  #status.hidden { opacity: 0; pointer-events: none; }
+  #status img { width: 160px; height: 160px; border-radius: 36px; }
+  #msg { font-size: 32px; opacity: .85; }
+</style>
+</head>
+<body>
+<video id="v" autoplay muted playsinline></video>
+<div id="status"><img src="../apple-touch-icon.png" alt=""><div id="msg">Yansio</div></div>
+<script>
+const NS = 'urn:x-cast:app.yansio.mirror';
+const video = document.getElementById('v');
+const status = document.getElementById('status');
+const msg = document.getElementById('msg');
+let session = 0;
+
+function say(text) { msg.textContent = text; status.classList.remove('hidden'); }
+
+// Yalnız yerel ağdaki Yansio sunucusu (özel IPv4 + port + 32 hane belirteç) kabul edilir.
+function allowed(url) {
+  const m = /^http:\/\/(\d+)\.(\d+)\.(\d+)\.(\d+):\d{2,5}\/[0-9a-f]{32}$/.exec(url);
+  if (!m) return false;
+  const [a, b] = [+m[1], +m[2]];
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+// Ham Annex-B akışı parçalı gelir: son başlangıç kodundan öncesi tam NAL'lerdir, kalan bekletilir.
+function lastStartCode(buf) {
+  for (let i = buf.length - 3; i >= 0; i--) if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) return i > 0 && buf[i - 1] === 0 ? i - 1 : i;
+  return -1;
+}
+
+async function play(url) {
+  const id = ++session;
+  if (!allowed(url)) { say('Geçersiz adres'); return; }
+  say('Bağlanıyor…');
+  const jm = new JMuxer({ node: 'v', mode: 'video', flushingTime: 0, fps: 30, maxDelay: 500, debug: false });
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+    const reader = res.body.getReader();
+    let pending = new Uint8Array(0);
+    let shown = false;
+    while (id === session) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const buf = new Uint8Array(pending.length + value.length);
+      buf.set(pending); buf.set(value, pending.length);
+      const cut = lastStartCode(buf);
+      if (cut > 0) { jm.feed({ video: buf.subarray(0, cut) }); pending = buf.slice(cut); } else { pending = buf; }
+      if (!shown && video.readyState >= 2) { shown = true; status.classList.add('hidden'); }
+      // Gecikme birikirse canlı uca atla.
+      const b = video.buffered;
+      if (b.length && b.end(b.length - 1) - video.currentTime > 1.5) video.currentTime = b.end(b.length - 1) - 0.2;
+    }
+    if (id === session) say('Yansıtma bitti');
+  } catch (e) {
+    if (id === session) say('Bağlantı kurulamadı');
+    console.error(e);
+  } finally {
+    jm.destroy();
+  }
+}
+
+const ctx = cast.framework.CastReceiverContext.getInstance();
+ctx.addCustomMessageListener(NS, (e) => { if (e.data && e.data.type === 'PLAY') play(String(e.data.url || '')); });
+const opts = new cast.framework.CastReceiverOptions();
+opts.customNamespaces = { [NS]: cast.framework.system.MessageType.JSON };
+opts.disableIdleTimeout = true;
+opts.skipPlayersLoad = true;
+ctx.start(opts);
+</script>
+</body>
+</html>
